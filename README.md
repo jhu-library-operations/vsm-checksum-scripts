@@ -14,6 +14,6 @@ The `runfixity.sh` script depends on:
 - -c: copy number (only 1-3 are supported; since 3 is typically offsite, in practice only 1 or 2)
 - -v: optional; volume serial number (vsn) e.g. DKARC04 (disk-archive) or A00033 (tape)
 
-The `getbaginfo` program is a multi-threaded program that can verify a Bagit bag directly on the disk-archive. This is convenient for large (e.g TB-sized) bags that are not in the cache. Its purpose is to be efficient (reading directly from archival media) and performant (calculating checksums in parallel -- assuming there is more than one file in the bag).
+The `getbaginfo` program is a multi-threaded program that can verify a Bagit bag directly on the disk-archive. This is convenient for large (e.g TB-sized) bags that are not in the cache. Its purpose is to be efficient (reading directly from VSM archival media) and performant (calculating checksums in parallel -- assuming there is more than one file in the bag). Also, `getbaginfo` takes a TAR file as input, calculating and verifying checksums without the need to untar the file first. This is useful for large (1TB) bags.
 
 NOTE: All the C programs require `boringssl` and VSM provided headers/includes. `boringssl` is required for multi-threading to work (only `getbaginfo` is mutli-threaded but I used it everywhere for consistency).
