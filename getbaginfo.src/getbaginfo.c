@@ -47,7 +47,7 @@ typedef enum {
     PAGE_SZ = 4096,
     WRK_SZ = 8192,
     NAME_POOL = 1048576, /* Each string pool is 1MB */
-    RECORDS_CHUNK = 10000,
+    RECORDS_CHUNK = 20000,
     MD_BUF_SZ = 4194304,
     PREFETCH = 8388608 
 } MyEnum;
@@ -93,6 +93,24 @@ typedef struct
     char calc_csum[129];
     unsigned int mdLen;
 } Record;
+
+/*
+ *
+ */
+typedef struct
+{
+    unsigned char fname_hash[EVP_MAX_MD_SIZE];
+    char csum[129];
+} Manifest;
+
+/*
+ *
+ */
+typedef struct
+{
+    unsigned char fname_hash[EVP_MAX_MD_SIZE];
+    size_t index;
+} Sortable;
 
 /*
  *
@@ -195,6 +213,8 @@ static void calc_fname_hash(Record *recs, int num_recs);
 static void calc_fname_hash_from_manifest_bits(char *bagname, char *filename, unsigned char *hash, unsigned int *mdLen);
 static bool get_next_tar_header(GnuTarHeader *tarHeader, TarFile *tarFile, TarFileBuffer *tarBuf, int *flag);
 static void read_next_tar_blk(TarFile *tarFile, TarFileBuffer *tarBuf, GnuTarHeader *out_buffer);
+int man_compare(const void * a, const void * b);
+int sortable_compare(const void * a, const void * b);
 
 void parseFileSize(size_t *filesize, const unsigned char *p, size_t n)
 {
@@ -856,16 +876,47 @@ init_bag(BagFile *bagFile)
     */
 }
 
-// return list of the Recs, sorted by fname_hash
-static Record **
-get_sorted_recs(BagFile *bagFile)
+int man_compare(const void * a, const void * b)
 {
-    Record *recs;
-    Record **sorted_recs;
-    int i,j;
+    Manifest *manA = (Manifest *)a;
+    Manifest *manB = (Manifest *)b;
 
-    sorted_recs = (Record **)malloc(sizeof(Record *));
-    return sorted_recs;
+    return memcmp(manB->fname_hash, manA->fname_hash, 16);
+}
+
+int sortable_compare(const void * a, const void * b)
+{
+    Sortable *sortA = (Sortable *)a;
+    Sortable *sortB = (Sortable *)b;
+
+    return memcmp(sortB->fname_hash, sortA->fname_hash, 16);
+}
+
+Sortable * get_fname_hash_idx(Record *recs, int n_recs) {
+    Sortable *qrecs;
+    int i,j;
+    int n_files=0;
+    // needs to be set elsewhere - we're using md5 for filename hashes
+    int mdLen = 16;
+
+    // Get number of files (not directories)
+    for (i=0; i<n_recs; i++) {
+        if (recs[i].type < 3) {
+	    n_files++;
+	}
+    }
+    qrecs = malloc(sizeof(Sortable)*n_files);
+
+    for (i=0,j=0; i<n_recs; i++) {
+        if (recs[i].type < 3) {
+	    memcpy(qrecs[j].fname_hash, recs[i].fname_hash, mdLen);
+	    qrecs[j].index = i;
+	    j++;
+	}
+    }
+    qsort(qrecs, n_files, sizeof(Sortable), sortable_compare);
+
+    return qrecs;
 }
 
 static void
@@ -877,10 +928,15 @@ parse_manifest(BagFile *bagFile)
     char *tmp;
     char fname[512];
     char csum[130];
-    int i,len;
+    int i,j,len;
     unsigned int mdLen;
     unsigned char h[EVP_MAX_MD_SIZE];
     char *hash_array;
+    Manifest *mans;
+    Sortable *qrecs;
+    int window = 300;
+    int m,t,w_t;
+    int n_lines=0;
 
     /* Now we have algorithm for calculation and also pointers into reclist to the bag metadata files.
      * 
@@ -893,9 +949,21 @@ parse_manifest(BagFile *bagFile)
     }
 
     recs = bagFile->tarFile->recs;
+    // Create an index of filename hashes from recs
+    qrecs = get_fname_hash_idx(recs, bagFile->tarFile->n_recs);
 
     buffer = malloc(sizeof(unsigned char)*(bagFile->manifest->filesize + 1));
     pread(fd, buffer, bagFile->manifest->filesize, bagFile->manifest->offset*TAR_BLK_SZ);
+
+    // Get number of lines in manifest file
+    for (i=0; i < (bagFile->manifest->filesize+1); i++) {
+        if (buffer[i] == '\n') {
+	    n_lines++;
+	}
+    }
+    mans = malloc(sizeof(Manifest)*n_lines);
+
+    i=0;
     line = strtok(buffer, "\n");
     while(line) {
 	// remove windows control character, if it exists
@@ -904,24 +972,45 @@ parse_manifest(BagFile *bagFile)
 	    *p = '\0';
 
 	memset(fname,'\0',sizeof(fname));
-	memset(csum,'\0',sizeof(csum));
-	memset(h, '\0', EVP_MAX_MD_SIZE);
+	memset(mans[i].csum,'\0',sizeof(csum));
+	memset(mans[i].fname_hash, '\0', EVP_MAX_MD_SIZE);
 
-	sscanf(line,"%s  %511c",csum,fname);
-        calc_fname_hash_from_manifest_bits(bagFile->bagname,fname,h,&mdLen);
+	sscanf(line,"%s  %511c",mans[i].csum,fname);
+        calc_fname_hash_from_manifest_bits(bagFile->bagname,fname,mans[i].fname_hash,&mdLen);
 
-	// search for this file in reclist
-	for (i=0; i<bagFile->tarFile->n_recs; i++) {
-	    if (recs[i].type == 0) {
-		if (memcmp(h,recs[i].fname_hash,mdLen) == 0) {
-		    strcpy(recs[i].manifest_csum,csum);
-		    break;
-		}
-	    }
-        }
 	line = strtok(NULL, "\n");
+        i++;
     }
     free(buffer);
+
+    qsort(mans, n_lines, sizeof(Manifest), man_compare);
+
+    window = (window < (bagFile->tarFile->n_recs/2)) ? window : 1;
+    for (m=0, t=0; m<n_lines; m++,t++) {
+	if (recs[qrecs[t].index].type > 2) {
+	    // skip
+	    m--;
+	}
+	else {
+            // drive from the manifest which has the fewest matches
+
+	    if (memcmp(mans[m].fname_hash, qrecs[t].fname_hash, mdLen) == 0) {
+	        strcpy(recs[qrecs[t].index].manifest_csum, mans[m].csum);
+	    }
+   	    else {
+		w_t = (window > t) ? 0 : (t-window);
+		while (w_t < (t+window) && w_t < bagFile->tarFile->n_recs) {
+		    if (recs[qrecs[w_t].index].type < 3) {
+		        if (memcmp(mans[m].fname_hash, qrecs[w_t].fname_hash, mdLen) == 0) {
+	                    strcpy(recs[qrecs[w_t].index].manifest_csum, mans[m].csum);
+			    break;
+		        }
+		    }
+		    w_t++;
+		}
+	    }
+	}
+    }
 
     /* tagmanifest.txt
      *
@@ -1091,7 +1180,6 @@ main(int argc, char **argv)
 	tarFile.recs = recs;
 
 	calc_fname_hash(recs, tarFile.n_recs);
-	//printf("Finished calculating fname hashes.\n");
 
 	// If expecting a BagIT "bag", do some more processing.
 	if (strcmp(arguments.mode,BAG) == 0) {
@@ -1177,8 +1265,10 @@ main(int argc, char **argv)
         }
 	if (strcmp(arguments.mode,BAG) == 0) {
 	    printf("\nFixity is good for %d out of %d files.\n", good, (good+bad+empty));
+	    printf("     Diff: %d\n", bad+empty);
 	    if (empty > 0)
-	        printf("\nEmpty files: %d\n", empty);
+	        printf("\nEmpty (zero-length) files: %d\n", empty);
+	        printf("Bad checksums: %d\n", bad);
 	    printf("\n");
 	}
 
@@ -1290,6 +1380,7 @@ md_calc(Record *rec)
             strcat(rec->calc_csum,tmp);
         }
         memset(calc_csum, '\0', 128);
+//printf("calculated chksum for %s\n",rec->filename);
 
         EVP_MD_CTX_destroy(ctx);
 }
@@ -1491,6 +1582,7 @@ calc_fname_hash(Record *recs, int num_recs)
 	        EVP_DigestInit(ctx,md);
 		EVP_DigestUpdate(ctx, recs[i].filename, strlen(recs[i].filename));
 		EVP_DigestFinal(ctx, recs[i].fname_hash, &(recs[i].mdLen));
+		
 		/*
 		printf("calc_fname_hash :: %d :: ",recs[i].mdLen);
 		for (j=0; j<(recs[i].mdLen); j++) {
@@ -1498,6 +1590,7 @@ calc_fname_hash(Record *recs, int num_recs)
 		}
 		printf(" - %s\n", recs[i].filename);
 		*/
+		
 	    }
 	}
 
@@ -1531,12 +1624,12 @@ calc_fname_hash_from_manifest_bits(char *bagname, char *filename, unsigned char 
         EVP_DigestUpdate(ctx, tmp, strlen(tmp));
         EVP_DigestFinal(ctx, hash, mdLen);
 
-	/*
+        /*
 	printf("calc_fname_hash_from_manifest_bits :: %d :: ",*mdLen);
         for (i=0; i<*mdLen; i++) {
 	    printf("%02x", hash[i]);
 	}
-	printf(" - %s\n",filename);
+	printf(" - %s\n",tmp);
 	*/
 
 	//free(tmp);
