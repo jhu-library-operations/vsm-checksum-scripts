@@ -101,6 +101,7 @@ typedef struct
 {
     unsigned char fname_hash[EVP_MAX_MD_SIZE];
     char csum[129];
+    char filename[513];
 } Manifest;
 
 /*
@@ -892,13 +893,14 @@ int sortable_compare(const void * a, const void * b)
     return memcmp(sortB->fname_hash, sortA->fname_hash, 16);
 }
 
-Sortable * get_fname_hash_idx(Record *recs, int n_recs) {
+Sortable * get_fname_hash_idx(Record *recs, int n_recs, size_t *n_qrecs) {
     Sortable *qrecs;
     int i,j;
-    int n_files=0;
+    size_t n_files=0;
     // needs to be set elsewhere - we're using md5 for filename hashes
     int mdLen = 16;
 
+    // if(strncmp(a, b, strlen(b)) == 0) return 1;
     // Get number of files (not directories)
     for (i=0; i<n_recs; i++) {
         if (recs[i].type < 3) {
@@ -916,6 +918,7 @@ Sortable * get_fname_hash_idx(Record *recs, int n_recs) {
     }
     qsort(qrecs, n_files, sizeof(Sortable), sortable_compare);
 
+    *n_qrecs = n_files;
     return qrecs;
 }
 
@@ -934,6 +937,7 @@ parse_manifest(BagFile *bagFile)
     char *hash_array;
     Manifest *mans;
     Sortable *qrecs;
+    size_t n_qrecs=0;
     int window = 300;
     int m,t,w_t;
     int n_lines=0;
@@ -947,10 +951,15 @@ parse_manifest(BagFile *bagFile)
         fprintf(stderr, "The manifest file is larger than we expected... (%lu)\n", bagFile->manifest->filesize);
 	exit(1);
     }
+    // Not sure this is a valid test
+    if (bagFile->manifest == NULL) {
+        fprintf(stderr, "There is no manifest file!\n");
+	exit(1);
+    }
 
     recs = bagFile->tarFile->recs;
     // Create an index of filename hashes from recs
-    qrecs = get_fname_hash_idx(recs, bagFile->tarFile->n_recs);
+    qrecs = get_fname_hash_idx(recs, bagFile->tarFile->n_recs, &n_qrecs);
 
     buffer = malloc(sizeof(unsigned char)*(bagFile->manifest->filesize + 1));
     pread(fd, buffer, bagFile->manifest->filesize, bagFile->manifest->offset*TAR_BLK_SZ);
@@ -971,12 +980,13 @@ parse_manifest(BagFile *bagFile)
 	if (p != NULL)
 	    *p = '\0';
 
-	memset(fname,'\0',sizeof(fname));
+	//memset(fname,'\0',sizeof(fname));
+	memset(mans[i].filename,'\0',sizeof(mans[i].filename));
 	memset(mans[i].csum,'\0',sizeof(csum));
 	memset(mans[i].fname_hash, '\0', EVP_MAX_MD_SIZE);
 
-	sscanf(line,"%s  %511c",mans[i].csum,fname);
-        calc_fname_hash_from_manifest_bits(bagFile->bagname,fname,mans[i].fname_hash,&mdLen);
+	sscanf(line,"%s  %511c",mans[i].csum,mans[i].filename);
+        calc_fname_hash_from_manifest_bits(bagFile->bagname,mans[i].filename,mans[i].fname_hash,&mdLen);
 
 	line = strtok(NULL, "\n");
         i++;
@@ -985,29 +995,37 @@ parse_manifest(BagFile *bagFile)
 
     qsort(mans, n_lines, sizeof(Manifest), man_compare);
 
-    window = (window < (bagFile->tarFile->n_recs/2)) ? window : 1;
-    for (m=0, t=0; m<n_lines; m++,t++) {
-	if (recs[qrecs[t].index].type > 2) {
-	    // skip
-	    m--;
+    /*
+    for (m=0;m<n_lines;m++) {
+	for (i=0; i<16; i++) {
+            printf("%02x", mans[m].fname_hash[i]);
 	}
-	else {
-            // drive from the manifest which has the fewest matches
+        printf(" - %s\n",mans[m].filename);
+    }
+    printf("------------------------\n");
+    printf("n_qrecs = %d\n", n_qrecs);
+    for (m=0;m<n_qrecs;m++) {
+	for (i=0; i<16; i++) {
+            printf("%02x", qrecs[m].fname_hash[i]);
+	}
+        printf(" - %s\n",recs[qrecs[m].index].filename);
+    }
+    printf("------END---------------\n");
+    */
 
-	    if (memcmp(mans[m].fname_hash, qrecs[t].fname_hash, mdLen) == 0) {
-	        strcpy(recs[qrecs[t].index].manifest_csum, mans[m].csum);
-	    }
-   	    else {
-		w_t = (window > t) ? 0 : (t-window);
-		while (w_t < (t+window) && w_t < bagFile->tarFile->n_recs) {
-		    if (recs[qrecs[w_t].index].type < 3) {
-		        if (memcmp(mans[m].fname_hash, qrecs[w_t].fname_hash, mdLen) == 0) {
-	                    strcpy(recs[qrecs[w_t].index].manifest_csum, mans[m].csum);
-			    break;
-		        }
-		    }
-		    w_t++;
+    window = (window < (bagFile->tarFile->n_recs/2)) ? window : 1;
+    for (m=0; m<n_lines; m++) {
+	if (memcmp(mans[m].fname_hash, qrecs[t].fname_hash, mdLen) == 0) {
+	    strcpy(recs[qrecs[t].index].manifest_csum, mans[m].csum);
+	}
+   	else {
+	    t = m;
+	    while (t < n_qrecs) {
+	        if (memcmp(mans[m].fname_hash, qrecs[t].fname_hash, mdLen) == 0) {
+	            strcpy(recs[qrecs[t].index].manifest_csum, mans[m].csum);
+		    break;
 		}
+		t++;
 	    }
 	}
     }
