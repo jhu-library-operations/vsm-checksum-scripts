@@ -29,9 +29,11 @@
  * size_t BUF_SZ = 4194304;
  */
 
+// Tar Header - https://www.gnu.org/software/tar/manual/html_node/Standard.html
+
                /* 0       1      2       3        4         5 */
 enum tar_header{EXTENDED, EMPTY, NORMAL, NONFILE, BADMAGIC, BADCHECKSUM};
-               /* 0       1          2       3          4         5 */
+               /* 0       1          2       3          4         5         6 */
 enum tar_flags{NORMALFILE,HARDLINK,SYMLINK,CHAR_DEVICE,BLK_DEVICE,DIRECTORY,FIFO};
 
 enum name_types{NAME_REG, NAME_LINK, NAME_EXT};
@@ -58,6 +60,7 @@ typedef enum {
 /*
  *
  */
+/*
 typedef struct
 {
     char name[100];
@@ -76,6 +79,32 @@ typedef struct
     char devmajor[8];
     char devminor[8];
     char prefix[155];
+    char pad[12];
+} GnuTarHeader;
+*/
+/*
+ *
+ */
+typedef struct
+{
+    char name[100];
+    char mode[8];
+    char uid[8];
+    char gid[8];
+    unsigned char size[12];
+    char mtime[12];
+    const char chksum[8];
+    char typeflag;
+    char linkname[100];
+    char magic[6];
+    char version[2];
+    char uname[32];
+    char gname[32];
+    char devmajor[8];
+    char devminor[8];
+    char prefix[131];
+    char atime[12];
+    char ctime[12];
     char pad[12];
 } GnuTarHeader;
 
@@ -197,7 +226,7 @@ typedef struct tpool {
 // 5MB
 //const int MAX_MANIFEST = 5242880;
 const int MAX_MANIFEST = 104857600;
-const char TAR_MAGIC[] = "ustar ";
+const char TAR_MAGIC[] = "ustar";
 int fd;
 unsigned char *f_mmap;
 char *algo = NULL;
@@ -216,6 +245,9 @@ static bool get_next_tar_header(GnuTarHeader *tarHeader, TarFile *tarFile, TarFi
 static void read_next_tar_blk(TarFile *tarFile, TarFileBuffer *tarBuf, GnuTarHeader *out_buffer);
 int man_compare(const void * a, const void * b);
 int sortable_compare(const void * a, const void * b);
+static void print_recs(Record *recs, int n_recs);
+static void get_headers_from_index(TarFile *tarFile, Record **recs);
+static void get_headers_from_tar(TarFile *tarFile, Record **recs);
 
 void parseFileSize(size_t *filesize, const unsigned char *p, size_t n)
 {
@@ -383,27 +415,52 @@ check_np_space(NamePool *np, short int len, int *offset)
     }
 }
 
+// Add prefix somehow?
 static void
-set_filename(char *name, Record *rec, NamePool *np, bool isextended)
+set_filename(char *name, char *prefix, Record *rec, NamePool *np, bool isextended)
 {
     int offset=0;
     int len=0;
+    int prefix_len=0;
+    int sep=0;
 
     len = strlen(name);
 
     offset = np->current_pool_bytes;
 
-    if ( (len > 100) && (!isextended) ) {
-        len = 100;
+    if (!isextended) {
+        if (len > 100) {
+	    len = 100;
+	}
+
+        prefix_len = strlen(prefix);
+	if (prefix_len > 155) {
+	    prefix_len = 155;
+	}
+	if (prefix_len > 0) {
+	    if (prefix[(prefix_len-1)] != '/') {
+	        sep=1;
+	    }
+	}
     }
 
-    check_np_space(np,len,&offset);
-    memcpy(np->current_pool+offset, name, len);
-    *(np->current_pool+offset+len) = '\0';
+    check_np_space(np,(len+prefix_len+sep),&offset);
+
+    if (!isextended) {
+        if (prefix_len > 0) {
+            memcpy(np->current_pool+offset, prefix, prefix_len);
+	    if (sep == 1) {
+                memcpy(np->current_pool+offset+prefix_len, "/", 1);
+	    }
+	}
+    }
+    memcpy(np->current_pool+offset+prefix_len+sep, name, len);
+
+    *(np->current_pool+offset+prefix_len+sep+len) = '\0';
 
     // +2 because we want it to point to the next available chunk
-    np->current_pool_bytes += (len+2);
-    np->total_bytes += (len+1);
+    np->current_pool_bytes += (len+prefix_len+sep+2);
+    np->total_bytes += (len+prefix_len+sep+1);
     rec->filename = np->current_pool+offset;
 }
 
@@ -422,7 +479,7 @@ set_link_filename(char *name, char *linkname, Record *rec, NamePool *np)
 
     offset = np->current_pool_bytes;
 
-    snprintf(np->current_pool+offset, len+1, "%s -> %s", linkname, name);
+    snprintf(np->current_pool+offset, len+1, "%s -> %s", name, linkname);
     rec->filename = np->current_pool+offset;
     np->current_pool_bytes += (len+2);
     np->total_bytes += (len+1);
@@ -445,10 +502,11 @@ static void
 set_name_in_rec(GnuTarHeader *tarHeader, Record *rec, NamePool *np, char typeflag) {
     short int len = 0;
 
+    //printf("typeflag = %c\n", typeflag);
     switch(typeflag) {
         case '1': // Hardlink
         case '2': // Symlink
-	    // linkename -> name
+	    // linkname -> name
 	    set_link_filename(tarHeader->name, tarHeader->linkname, rec, np);
 	    break;
         case '0': // Normal File
@@ -456,10 +514,10 @@ set_name_in_rec(GnuTarHeader *tarHeader, Record *rec, NamePool *np, char typefla
         case '4': // Block device
         case '5': // Directory
         case '6': // FIFO
-	    set_filename(tarHeader->name, rec, np, false);
+	    set_filename(tarHeader->name, tarHeader->prefix, rec, np, false);
 	    break;
         case 'L': // Extended
-	    set_filename((char *)tarHeader, rec, np, true);
+	    set_filename((char *)tarHeader, NULL, rec, np, true);
 	    break;
     }
 }
@@ -488,7 +546,7 @@ static void
 get_headers_from_tar(TarFile *tarFile, Record **recs)
 {
 	TarFileBuffer tarBuf;
-	GnuTarHeader tarHeader;
+        GnuTarHeader tarHeader;
 	NamePool *np;
 	int flag;
 	size_t filesize;
@@ -521,6 +579,7 @@ get_headers_from_tar(TarFile *tarFile, Record **recs)
 		    // do nothing
 		    break;
 		case EXTENDED:
+		    //printf("EXTENDED!\n");
 		    // get the extended name
 		    get_next_tar_header(&tarHeader, tarFile, &tarBuf, &flag);
 		    set_name_in_rec(&tarHeader, &(*recs)[tarFile->n_recs], np, 'L');
@@ -541,6 +600,7 @@ get_headers_from_tar(TarFile *tarFile, Record **recs)
 		    }
 		    break;
 		case NORMAL:
+		    //printf("NORMAL!\n");
 		    set_name_in_rec(&tarHeader, &(*recs)[tarFile->n_recs], np, tarHeader.typeflag);
 		    //printf("recs[%d].filename = %s\n", tarFile->n_recs, (*recs)[tarFile->n_recs].filename);
 		    (*recs)[tarFile->n_recs].type = strtol(&tarHeader.typeflag,NULL,10);
@@ -556,6 +616,7 @@ get_headers_from_tar(TarFile *tarFile, Record **recs)
 		    }
 		    break;
 		case NONFILE:
+		    //printf("NONFILE!\n");
 		    set_name_in_rec(&tarHeader, &(*recs)[tarFile->n_recs], np, tarHeader.typeflag);
 		    //printf("recs[%d].filename = %s\n", tarFile->n_recs, (*recs)[tarFile->n_recs].filename);
 		    (*recs)[tarFile->n_recs].type = strtol(&tarHeader.typeflag,NULL,10);
@@ -573,6 +634,9 @@ get_headers_from_tar(TarFile *tarFile, Record **recs)
 		    break;
 		case BADCHECKSUM:
 		    fprintf(stderr, "Encountered bad tar header checksum.\n");
+		    break;
+		default:
+		    printf("WTF. The flag = %c\n", flag);
 		    break;
 	    }
 	}
@@ -636,6 +700,31 @@ get_next_tar_header(GnuTarHeader *tarHeader, TarFile *tarFile, TarFileBuffer *ta
     read_next_tar_blk(tarFile, tarBuf, tarHeader);
 
     memset (&emptyHeader, 0, TAR_BLK_SZ);
+// ************************
+/*
+printf("name = %s\n", tarHeader->name);
+printf("mode = %.8s\n", tarHeader->mode);
+printf("uid = %.8s\n", tarHeader->uid);
+printf("gid = %.8s\n", tarHeader->gid);
+printf("size = %.12s\n", tarHeader->size);
+printf("mtime = %.12s\n", tarHeader->mtime);
+printf("chksum = %.8s\n", tarHeader->chksum);
+printf("typeflag = %c\n", tarHeader->typeflag);
+printf("linkname = %s\n", tarHeader->linkname);
+printf("magic = %.6s\n", tarHeader->magic);
+printf("version = %.2s\n", tarHeader->version);
+printf("uname = %s\n", tarHeader->uname);
+printf("gname = %s\n", tarHeader->gname);
+printf("devmajor = %.8s\n", tarHeader->devmajor);
+printf("devminor = %.8s\n", tarHeader->devminor);
+printf("prefix = %s\n", tarHeader->prefix);
+printf("atime = %.12s\n", tarHeader->atime);
+printf("ctime = %.12s\n", tarHeader->ctime);
+printf("pad = %.12s\n", tarHeader->pad);
+printf("***********\n");
+*/
+
+// printf("magic = %s; typeflag = %c; prefix = %s; name = %s; atime = %s; ctime = %s\n", tarHeader->magic, tarHeader->typeflag, tarHeader->prefix, tarHeader->name, tarHeader->atime, tarHeader->ctime);
 
     if (0 == memcmp(tarHeader, &emptyHeader, TAR_BLK_SZ)) {
 	if (*flag == EMPTY) {
@@ -690,7 +779,7 @@ print_bag_file(const char *bagit_file, BagFile *bagFile)
     }
 
     printf("\nFilename: %s; size = %lu\n\n", rec->filename,rec->filesize);
-    buffer = malloc((sizeof(char)*(rec->filesize)+1));
+    buffer = malloc( sizeof(char)*(rec->filesize)+1 );
     pread(fd, buffer, rec->filesize, rec->offset*TAR_BLK_SZ);
     buffer[rec->filesize] = 0;
     line = strtok(buffer, "\n");
@@ -806,14 +895,9 @@ init_bag(BagFile *bagFile)
         free(algo);
 	algo = NULL;
     }
+    // Find the manifest first, and strongest algo if multiple manifests
     for (i=0; i<bagFile->tarFile->n_recs; i++) {
-	//printf("%d %lu %s\n",i, recs[i].filesize, recs[i].filename);
-
-        if (strstr(recs[i].filename, baginfo_search) != NULL)
-            bagFile->baginfo = &recs[i];
-        else if (strstr(recs[i].filename, bagit_search) != NULL)
-            bagFile->bagit = &recs[i];
-        else if (strstr(recs[i].filename, manifest_search) != NULL) {
+        if (strstr(recs[i].filename, manifest_search) != NULL) {
             char *test = strrchr(recs[i].filename, '-');
             test++;
 	    const char *tmpalgo;
@@ -846,9 +930,29 @@ init_bag(BagFile *bagFile)
 		}
 	    }
         }
+    }
+    // Now get everything else; Assume that tagmanifest has same algo as main manifest
+    for (i=0; i<bagFile->tarFile->n_recs; i++) {
+	//printf("%d %lu %s\n",i, recs[i].filesize, recs[i].filename);
+
+        if (strstr(recs[i].filename, baginfo_search) != NULL)
+            bagFile->baginfo = &recs[i];
+        else if (strstr(recs[i].filename, bagit_search) != NULL)
+            bagFile->bagit = &recs[i];
         else if (strstr(recs[i].filename, tagmanifest_search) != NULL) {
-            bagFile->tagmanifest = &recs[i];
-            bagFile->tagmanifest->type = 8;
+	    // remove tagmanifest from checksum review
+	    recs[i].type = 8;
+
+            char *test = strrchr(recs[i].filename, '-');
+            test++;
+	    char *newtest = strdup(test);
+	    char *end = strrchr(newtest, '.');
+	    // remove the trailing ".txt"
+	    *end = '\0';
+            if (strcasecmp(newtest,algo) == 0) {
+                bagFile->tagmanifest = &recs[i];
+                bagFile->tagmanifest->type = 8;
+	    }
         }
         else {
             // regular data file
@@ -929,8 +1033,8 @@ parse_manifest(BagFile *bagFile)
     unsigned char *buffer;
     char *line;
     char *tmp;
-    char fname[512];
     char csum[130];
+    char fname[512];
     int i,j,len;
     unsigned int mdLen;
     unsigned char h[EVP_MAX_MD_SIZE];
@@ -961,8 +1065,9 @@ parse_manifest(BagFile *bagFile)
     // Create an index of filename hashes from recs
     qrecs = get_fname_hash_idx(recs, bagFile->tarFile->n_recs, &n_qrecs);
 
-    buffer = malloc(sizeof(unsigned char)*(bagFile->manifest->filesize + 1));
+    buffer = malloc( sizeof(char)*(bagFile->manifest->filesize)+1 );
     pread(fd, buffer, bagFile->manifest->filesize, bagFile->manifest->offset*TAR_BLK_SZ);
+    buffer[bagFile->manifest->filesize] = 0;
 
     // Get number of lines in manifest file
     for (i=0; i < (bagFile->manifest->filesize+1); i++) {
@@ -980,7 +1085,6 @@ parse_manifest(BagFile *bagFile)
 	if (p != NULL)
 	    *p = '\0';
 
-	//memset(fname,'\0',sizeof(fname));
 	memset(mans[i].filename,'\0',sizeof(mans[i].filename));
 	memset(mans[i].csum,'\0',sizeof(csum));
 	memset(mans[i].fname_hash, '\0', EVP_MAX_MD_SIZE);
@@ -995,6 +1099,7 @@ parse_manifest(BagFile *bagFile)
 
     qsort(mans, n_lines, sizeof(Manifest), man_compare);
 
+// Print out the Manifest array followed by the Sortable (sorted recs) array.
     /*
     for (m=0;m<n_lines;m++) {
 	for (i=0; i<16; i++) {
@@ -1037,8 +1142,10 @@ parse_manifest(BagFile *bagFile)
      * a1ede069edbffc15d574b9f453403a08  bag-info.txt
      */
     //
-    buffer = malloc( sizeof(unsigned char)*(bagFile->tagmanifest->filesize+1) );
+    buffer = malloc( sizeof(char)*(bagFile->tagmanifest->filesize)+1 );
     pread(fd, buffer, bagFile->tagmanifest->filesize, bagFile->tagmanifest->offset*TAR_BLK_SZ);
+    buffer[bagFile->tagmanifest->filesize] = 0;
+
     line = strtok(buffer, "\n");
     while(line) {
 	// remove windows control character, if it exists
@@ -1188,14 +1295,24 @@ main(int argc, char **argv)
 	// Build list of tar-file contents
 	recs = malloc(sizeof(Record)*RECORDS_CHUNK);
 	tarFile.recs_allocation = RECORDS_CHUNK;
-	get_headers_from_tar(&tarFile,&recs);
 
-	//printf("Finished getting records.\n");
-	//printf("recs: %d; last fname: %s\n", tarFile.n_recs,recs[0].filename);
+	get_headers_from_index(&tarFile,&recs);
+        if (recs == NULL) {
+	    //printf("Aw hay, INDEX is null\n");
+	    recs = malloc(sizeof(Record)*RECORDS_CHUNK);
+  	    get_headers_from_tar(&tarFile,&recs);
+        }
+
+        // printf("Finished getting records.\n");
+	// printf("recs: %d; last fname: %s\n", tarFile.n_recs,recs[0].filename);
 	// reduce rec array to free space?
 	//recs = realloc(recs, sizeof(Record)*tarFile.n_recs);
 
 	tarFile.recs = recs;
+/*
+print_recs(recs,tarFile.n_recs);
+exit(0);
+*/
 
 	calc_fname_hash(recs, tarFile.n_recs);
 
@@ -1652,4 +1769,131 @@ calc_fname_hash_from_manifest_bits(char *bagname, char *filename, unsigned char 
 
 	//free(tmp);
         EVP_MD_CTX_destroy(ctx);
+}
+
+static void
+print_recs(Record *recs, int n_recs) {
+   int i=0;
+
+printf("size of int = %d\n", sizeof(n_recs));
+    for (i=0;i<n_recs;i++) {
+        printf("%d|%d|%d|%s\n", recs[i].type, recs[i].offset, recs[i].filesize, recs[i].filename);
+    }
+}
+
+// If INDEX file exists at beginning of archive, create Records array
+// Otherwise set Records array to null
+static void
+get_headers_from_index(TarFile *tarFile, Record **recs) 
+{
+        TarFileBuffer tarBuf; 
+        GnuTarHeader tarHeader;
+        NamePool *np;
+        int flag;
+        size_t filesize;
+        char *buffer;
+        char *line;
+        char name[512];
+        char filename[512];
+        char linkname[512];
+	int i;
+        bool hasindex = false;
+
+        tarFile->np = malloc(sizeof(NamePool));
+        np = tarFile->np;
+        // initialize NamePool
+        init_np(np);
+
+        // set up memory map for file (this is the entire TAR file)
+        f_mmap = mmap(NULL, tarFile->size, PROT_READ, MAP_PRIVATE, fd, 0); 
+
+        // spin up thread pool of one thread to build Records 
+        // Now spin up a thread pool and work queue and start adding jobs to the queue
+        // one job is the file descriptor, the file offset, size
+
+        tarBuf.do_prefetch = true; 
+        tarBuf.prefetch = 0;
+        tarBuf.bufsize = 0;
+        tarBuf.buf_bytes_read = 0;
+        tarBuf.total_bytes_read = 0;
+        tarFile->n_recs = 0;
+
+        // each time through this loop, a new tar record will be processed
+        // there are not multiple iterations for, e.g. an extended ('L') header
+        get_next_tar_header(&tarHeader, tarFile, &tarBuf, &flag);
+        //printf("%d\n", tarFile->n_recs);
+        switch(flag) {
+            case NORMAL: 
+                set_name_in_rec(&tarHeader, &(*recs)[tarFile->n_recs], np, tarHeader.typeflag);
+                //printf("recs[%d].filename = %s\n", tarFile->n_recs, (*recs)[tarFile->n_recs].filename);
+                (*recs)[tarFile->n_recs].type = strtol(&tarHeader.typeflag,NULL,10);
+
+                parseFileSize(&filesize, tarHeader.size, 12);
+                (*recs)[tarFile->n_recs].filesize = filesize;
+                (*recs)[tarFile->n_recs].offset = (tarBuf.total_bytes_read + tarFile->sam_offset_bytes)/TAR_BLK_SZ;
+
+		if (strcmp((*recs)[0].filename,"INDEX") == 0) {
+		    hasindex = true;
+		}
+                break;  
+
+            default:
+		;
+                //fprintf(stderr, "NO INDEX!\n");
+        }
+        munmap(f_mmap,tarFile->size);
+
+	if (!hasindex) {
+	    *recs = NULL;
+        }
+        else {
+            buffer = malloc(sizeof(char)*filesize + 1);
+            pread(fd, buffer, filesize, TAR_BLK_SZ);
+            line = strtok(buffer, "\n");
+
+	    // Get the number of files
+	    tarFile->n_recs = 0;
+            while(line) {
+	        tarFile->n_recs++;
+                line = strtok(NULL, "\n");
+	    }
+
+	    (*recs) = malloc(sizeof(Record)*tarFile->n_recs);
+            memset(buffer,'\0',sizeof(buffer));
+            pread(fd, buffer, filesize, TAR_BLK_SZ);
+            line = strtok(buffer, "\n");
+	    i=0;
+            while(line) {
+                // remove windows control character, if it exists
+                char *p = strchr(line, '\r');
+                if (p != NULL) {
+                    *p = '\0';
+	        }
+
+                memset(name,'\0',sizeof(name));
+                memset(filename,'\0',sizeof(filename));
+                memset(linkname,'\0',sizeof(linkname));
+
+                sscanf(line,"%d|%d|%d|%[^\t\n]\n", &(*recs)[i].type, &(*recs)[i].offset, &(*recs)[i].filesize, filename);
+
+                switch((*recs)[i].type) {
+                    case 1: // Hardlink
+                    case 2: // Symlink
+                        // name -> linkname
+		        sscanf(filename,"%s -> %s",name,linkname);
+                        set_link_filename(name, linkname, &(*recs)[i], np);
+                        break;
+                    case 0: // Normal File
+                    case 3: // Character device
+                    case 4: // Block device
+                    case 5: // Directory
+                    case 6: // FIFO
+                        set_filename(filename, NULL, &(*recs)[i], np, true);
+                        break;
+                }
+                line = strtok(NULL, "\n");
+	        i++;
+            }
+            free(buffer);
+        }
 }
